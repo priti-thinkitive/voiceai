@@ -1,0 +1,31 @@
+[project]
+name = "voiceai-backend"
+version = "0.1.0"
+description = "VoiceAI — B2B voice-AI infrastructure API"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "SIM", "N"]
+ignore = [
+    "E501",  # line too long - handled by formatter
+    "B008",  # FastAPI Depends() in defaults is idiomatic
+]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+plugins = ["pydantic.mypy"]
+ignore_missing_imports = true
+disallow_untyped_decorators = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# The standards doc's canonical value is "backend/tests" (written for a
+# monorepo where pytest runs from a parent dir one level above `backend/`).
+# This project's root IS `backend/` itself (see task scope), so the
+# equivalent path relative to this pyproject.toml is just "tests".
+testpaths = ["tests"]
