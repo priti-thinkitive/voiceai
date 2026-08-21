@@ -21,7 +21,18 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from app.config import get_settings
 from app.database import connect_to_mongo, disconnect_from_mongo
 from app.errors import install_exception_handlers
-from app.routers import _error_check, admin_docs, agents, calls, health, languages, platform, voices, webhooks
+from app.routers import (
+    _error_check,
+    admin_docs,
+    agents,
+    calls,
+    health,
+    languages,
+    platform,
+    telephony,
+    voices,
+    webhooks,
+)
 from app.utils.request_context import set_request_id
 
 logging.basicConfig(level=logging.INFO)
@@ -100,6 +111,7 @@ def create_app() -> FastAPI:
     app.include_router(platform.admin_router)
     app.include_router(voices.router)
     app.include_router(languages.router)
+    app.include_router(telephony.router)
     app.include_router(calls.router)
     app.include_router(webhooks.router)
     if settings.docs_enabled:
