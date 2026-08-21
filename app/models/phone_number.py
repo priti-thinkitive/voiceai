@@ -183,6 +183,129 @@ class CreatePhoneNumberRequest(BaseModel):
     ] = None
 
 
+# Internal sourcing note (plain comment, NOT the class docstring below — a
+# Pydantic model's class docstring renders as that schema's `description` in
+# Swagger's components.schemas, so vendor-identifying text must never live
+# there; see this codebase's standards doc, "Swagger-visible text must never
+# name the vendor" section). Confirmed via a fresh live WebFetch this
+# session (docs.retellai.com/api-references/update-phone-number): `PATCH
+# /update-phone-number/{phone_number}` — the phone number is a path
+# parameter (matching this codebase's existing delete-phone-number/
+# get-phone-number pattern, NOT a body field), every field on the request
+# body is optional/nullable, and it is a genuine field-level partial-merge
+# endpoint (confirmed the same way update-agent/update-retell-llm already
+# were for PATCH /agents/{agent_id} — see that endpoint's own module
+# docstring in app/routers/agents.py): an omitted field leaves the vendor's
+# existing stored value untouched, only fields actually present in the
+# request body are changed. The real field name for renaming is `nickname`
+# (a plain string). The real field name for rebinding is `inbound_agents` —
+# an array of `{agent_id, agent_version, weight}` objects, the SAME
+# array-of-AgentWeight binding mechanism create_phone_number()/
+# import_phone_number() already use (see retell_adapter.py's module
+# docstring — the older singular `inbound_agent_id` field remains confirmed
+# deprecated as of 2026-03-31 and is never sent by this codebase). This
+# re-confirms, fresh, that `inbound_agents` is still the current, correct
+# field for this task rather than trusting a cached assumption carried over
+# from the create/import endpoints. The vendor's own `nickname` field is
+# documented as "for your reference only" with no special vendor-side
+# meaning for an empty string (unlike welcome_message's real, vendor-
+# meaningful three-state distinction between omitted/null/empty-string on
+# PATCH /agents/{agent_id}) — this is why `nickname` below does not need a
+# separate clear_* flag; see its own Field description for the full
+# reasoning kept vendor-neutral.
+class UpdatePhoneNumberRequest(BaseModel):
+    """PATCH /agents/{agent_id}/numbers/{phone_number} request body — closes
+    a real, confirmed gap: until now there was no way to rename a number's
+    `nickname` or rebind it to a different agent without deleting and
+    recreating it. Deleting a *bought* number risks losing it permanently
+    (per DELETE /agents/{agent_id}/numbers/{phone_number}'s own docstring:
+    "not guaranteed to be available to re-provision later"), and for a BYO
+    SIP number it means re-entering SIP trunk credentials all over again —
+    a small, low-risk rename/rebind operation should not require that level
+    of risk.
+
+    **Both fields are optional — a caller can rename only, rebind only, or
+    both in one call**, matching PATCH /agents/{agent_id}'s own "true partial
+    update, omit what you don't want to change" convention. `omit ==
+    unchanged` for BOTH fields here — there is no `clear_nickname`-style flag
+    the way UpdateAgentRequest needs for welcome_message/transfer_number/
+    agent_name, and that asymmetry is deliberate, not an inconsistency:
+    those three fields on UpdateAgentRequest need a separate clear flag
+    specifically because Pydantic parses an explicit `null` in the request
+    JSON identically to an omitted field once the field type itself is
+    `X | None` — there is no way, from the parsed body alone, to distinguish
+    "the caller explicitly wants this cleared" from "the caller didn't
+    mention this field at all." `nickname` here has the exact same
+    theoretical ambiguity (its type is `str | None`) — but unlike those three
+    fields, nothing in this endpoint's real scope needs a distinct
+    THIRD state ("explicitly clear the nickname back to none," as opposed to
+    "leave whatever nickname is currently set alone") to be reachable via a
+    single PATCH call. A caller who wants to clear a nickname can simply send
+    `nickname: ""` (empty string) — the voice vendor's own `nickname` field
+    is "for your reference only" with no special vendor-side meaning for an
+    empty string, unlike welcome_message's real, vendor-meaningful
+    three-state distinction between omitted/null/empty-string — so an empty
+    string is both a real, useful "no nickname" value on our side AND
+    something `has_any_field_set()` below correctly still recognizes as "the
+    caller touched this field" (since `""` is not `None`). This is the
+    simplest-correct choice per the standards doc's own guidance to compare
+    against `welcome_message`'s precedent and use judgment rather than copy
+    a heavier pattern nothing here actually needs — revisit only if a real
+    future need for a genuine three-state distinction on `nickname`
+    specifically shows up.
+
+    `agent_id` is VoiceAI's own Mongo agent id (never the voice vendor's raw
+    agent id — same "never leak vendor identity" translation every other
+    endpoint in this codebase already performs), tenancy-scoped and
+    status-checked by the router exactly like every other agent lookup — see
+    PATCH /agents/{agent_id}/numbers/{phone_number}'s own docstring in
+    app/routers/agents.py for the full validation contract.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "nickname": "Aspen Quality Care — after-hours line",
+                "agent_id": "6706f1a2b3c4d5e6f7089abc",
+            }
+        }
+    )
+
+    nickname: Annotated[
+        str | None,
+        Field(
+            max_length=200,
+            description="A new internal display label for this number. Omit to leave the "
+            "current nickname unchanged. Send an empty string to clear it back to none — "
+            "there is no separate clear flag, since (unlike welcome_message on PATCH "
+            "/agents/{agent_id}) an empty string here is already a real, unambiguous "
+            "'no nickname' value with no other special meaning.",
+        ),
+    ] = None
+    agent_id: Annotated[
+        str | None,
+        Field(
+            description="Rebind this number to a different agent of yours, by our own agent "
+            "id (from POST /agents' response) — never the voice vendor's own agent id. Omit "
+            "to leave the number bound to its current agent. The target agent must belong to "
+            "you and must have finished creation on the voice vendor (status != 'failed').",
+        ),
+    ] = None
+
+    def has_any_field_set(self) -> bool:
+        """Same "an entirely-empty PATCH body is well-formed Pydantic but a
+        meaningless no-op" check as UpdateAgentRequest.has_any_field_set() —
+        deliberately NOT enforced as a model-level validator (matching that
+        model's own precedent exactly, not just its spirit): the ROUTER is
+        what rejects an empty request with a clear 422, by calling this
+        method itself, same as PATCH /agents/{agent_id} already does — see
+        that endpoint's own docstring in app/routers/agents.py, step 2, and
+        `update_agent`'s "reject an empty request" reasoning, which applies
+        identically here.
+        """
+        return self.nickname is not None or self.agent_id is not None
+
+
 class ImportPhoneNumberRequest(BaseModel):
     """POST /agents/{agent_id}/numbers/byo request body — Option 2 of
     "Telephony: two options" (bring your own SIP trunk), per

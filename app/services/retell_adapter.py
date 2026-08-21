@@ -238,6 +238,23 @@ task); the router now sends VoiceAI's own `{settings.BASE_URL}/webhooks/
 retell/inbound` here on every purchase/import so Retell has somewhere real to
 send the webhook. Without this, the new inbound webhook endpoint this
 module's docstring above describes would never actually receive a call.
+
+`update_phone_number()` — PATCH /agents/{agent_id}/numbers/{phone_number}
+support (closes a real, confirmed gap: no way to rename a number's nickname
+or rebind it to a different agent without deleting and recreating it, which
+for a bought number risks losing it permanently and for a BYO SIP number
+means re-entering trunk credentials all over again). Confirmed via a fresh
+live WebFetch this session (docs.retellai.com/api-references/
+update-phone-number): `PATCH /update-phone-number/{phone_number}` — the
+phone number is a path parameter, same as `delete_phone_number()` above, not
+a body field. Every field is optional/nullable and this is a genuine
+field-level partial-merge endpoint, same confirmed behavior as
+update-agent/update-retell-llm. Real field names re-confirmed fresh, not
+assumed: `nickname` (str) for renaming, and `inbound_agents` (the SAME
+array-of-`{agent_id, weight}` form create_phone_number()/
+import_phone_number() already use above — re-confirming the older singular
+`inbound_agent_id` remains deprecated) for rebinding to a different agent.
+See this function's own docstring for the full field-by-field reasoning.
 """
 
 from __future__ import annotations
@@ -789,6 +806,133 @@ async def import_phone_number(
         raise AppError(
             code=CODE_UPSTREAM_FAILED,
             message="The voice vendor returned an unexpected response while importing the "
+            "phone number.",
+            status_code=502,
+            log_extra={"vendor": VENDOR_NAME},
+        )
+    return RetellCreatePhoneNumberResult(
+        phone_number=returned_number,
+        area_code=data.get("area_code"),
+        nickname=data.get("nickname"),
+    )
+
+
+async def update_phone_number(
+    settings: Settings,
+    *,
+    phone_number: str,
+    nickname: str | None = None,
+    retell_agent_id: str | None = None,
+) -> RetellCreatePhoneNumberResult:
+    """Call Retell's real `PATCH /update-phone-number/{phone_number}` —
+    PATCH /agents/{agent_id}/numbers/{phone_number} support (closes the real,
+    confirmed gap: no way to rename a number's nickname or rebind it to a
+    different agent without deleting and recreating it).
+
+    **Confirmed via a fresh live WebFetch this session**
+    (docs.retellai.com/api-references/update-phone-number), not carried over
+    from any earlier assumption: `PATCH /update-phone-number/{phone_number}`
+    — the phone number is a **path** parameter (e.g.
+    `/update-phone-number/+14157774444`), matching this module's own
+    `delete_phone_number()`/`get-voice`-style path-parameter pattern, NOT a
+    body field. Every request field is optional/nullable and this is a
+    genuine field-level partial-merge endpoint — an omitted field leaves
+    Retell's existing stored value for that field untouched (same confirmed
+    behavior as `update-agent`/`update-retell-llm`, see
+    retell_agent_adapter.py's `update_agent()`/`update_retell_llm()`
+    docstrings for those two sibling confirmations). This function therefore
+    only ever includes a key in the outgoing body when the caller actually
+    passed a non-None value for it — never sends a field just to "reset it
+    to default," since Retell's own partial-merge semantics make that
+    unnecessary and potentially destructive to fields the caller never meant
+    to touch.
+
+    `nickname` (str) is the confirmed real field name for renaming — a plain
+    string, "for your reference only" per Retell's own docs, with no special
+    vendor-side meaning for an empty string (unlike e.g. `begin_message` on
+    update-retell-llm, which genuinely distinguishes omitted/null/empty-
+    string — see retell_agent_adapter.py's update_retell_llm() docstring for
+    that contrast). `retell_agent_id` (Retell's own agent id — the caller
+    must pass Agent.vendor_ref, never our own Mongo agent id) is translated
+    here into the real `inbound_agents` field — an array of
+    `{"agent_id": ..., "weight": 1.0}` objects, the SAME array-of-AgentWeight
+    binding mechanism `create_phone_number()`/`import_phone_number()` already
+    use above. This re-confirms, fresh, that `inbound_agents` (not the
+    deprecated singular `inbound_agent_id`, confirmed deprecated as of
+    2026-03-31) is still the current, correct field for rebinding — the same
+    array form is used consistently across every phone-number vendor call in
+    this module, create/import/update alike.
+
+    Raises `AppError(code="upstream_failed")` on any network error, timeout,
+    or non-2xx response — same never-leak-raw-response pattern as every
+    other adapter function in this module. `AppError(code="not_found")` is
+    NOT raised here for a 404 (unlike get_voice() above) — the router already
+    confirms the phone number belongs to the calling platform via our own
+    PhoneNumbers collection before ever reaching this function, so a 404 from
+    Retell at this point would indicate a genuine, unexpected drift between
+    our records and the vendor's (the number exists in our DB but not on
+    Retell's side) rather than an ordinary "not found" a caller could have
+    triggered — that is a vendor-rejection case, not a not-found case, so it
+    is treated the same as any other non-2xx: `upstream_failed`/502.
+    """
+    body: dict[str, Any] = {}
+    if nickname is not None:
+        body["nickname"] = nickname
+    if retell_agent_id is not None:
+        body["inbound_agents"] = [{"agent_id": retell_agent_id, "weight": 1.0}]
+
+    try:
+        async with httpx.AsyncClient(
+            base_url=settings.RETELL_API_BASE,
+            headers={
+                "Authorization": f"Bearer {settings.RETELL_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            timeout=httpx.Timeout(15.0),
+        ) as client:
+            resp = await client.patch(f"/update-phone-number/{phone_number}", json=body)
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "Retell update-phone-number request failed",
+            extra={"vendor": VENDOR_NAME, "error_class": type(exc).__name__},
+        )
+        raise AppError(
+            code=CODE_UPSTREAM_FAILED,
+            message="Could not reach the voice vendor to update the phone number. "
+            "Try again shortly.",
+            status_code=502,
+            log_extra={"vendor": VENDOR_NAME, "error_class": type(exc).__name__},
+        ) from exc
+
+    if resp.status_code >= 400:
+        logger.warning(
+            "Retell update-phone-number returned an error",
+            extra={
+                "vendor": VENDOR_NAME,
+                "upstream_status": resp.status_code,
+            },
+        )
+        raise AppError(
+            code=CODE_UPSTREAM_FAILED,
+            message="The voice vendor rejected the phone number update request.",
+            status_code=502,
+            log_extra={
+                "vendor": VENDOR_NAME,
+                "upstream_status": resp.status_code,
+                "upstream_body": resp.text[:2000],
+            },
+        )
+
+    data = resp.json()
+    returned_number = data.get("phone_number")
+    if not returned_number:
+        logger.error(
+            "Retell update-phone-number succeeded but response is missing phone_number",
+            extra={"vendor": VENDOR_NAME},
+        )
+        raise AppError(
+            code=CODE_UPSTREAM_FAILED,
+            message="The voice vendor returned an unexpected response while updating the "
             "phone number.",
             status_code=502,
             log_extra={"vendor": VENDOR_NAME},

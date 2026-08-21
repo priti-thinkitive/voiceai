@@ -76,6 +76,11 @@ class Settings(BaseSettings):
     # from). Empty AWS_S3_BUCKET is the signal this isn't configured yet.
     AWS_ACCESS_KEY_ID: str = ""
     AWS_SECRET_ACCESS_KEY: str = ""
+    # Optional — only set for temporary STS credentials (e.g. an SSO-assumed
+    # role), never present for a permanent IAM user's access key. Empty is
+    # the normal case; boto3 only needs this alongside the two keys above
+    # when they're STS-issued.
+    AWS_SESSION_TOKEN: str = ""
     AWS_S3_BUCKET: str = ""
     AWS_REGION: str = "us-east-1"
 

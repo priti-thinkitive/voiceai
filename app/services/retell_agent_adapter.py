@@ -498,7 +498,9 @@ def _build_agent_tuning_fields(
     body: dict[str, Any] = {
         "voice_temperature": voice_temperature,
         "stt_mode": stt_mode.value if hasattr(stt_mode, "value") else stt_mode,
-        "denoising_mode": denoising_mode.value if hasattr(denoising_mode, "value") else denoising_mode,
+        "denoising_mode": denoising_mode.value
+        if hasattr(denoising_mode, "value")
+        else denoising_mode,
         "ambient_sound_volume": ambient_sound_volume,
         "backchannel_frequency": backchannel_frequency,
         "responsiveness": responsiveness,
@@ -861,7 +863,7 @@ async def create_retell_llm(
     # is not None, deliberately — see this function's own docstring and this
     # module's docstring for why a truthy check here would be a real bug
     # (silently dropping the "wait silently for the caller" welcome_message
-    #="" case).
+    # ="" case).
     if welcome_message is not None:
         body["begin_message"] = welcome_message
 
@@ -962,6 +964,78 @@ async def delete_retell_llm(settings: Settings, *, llm_id: str) -> None:
         raise AppError(
             code=CODE_UPSTREAM_FAILED,
             message="The voice vendor rejected the request to clean up the conversation brain.",
+            status_code=502,
+            log_extra={
+                "vendor": VENDOR_NAME,
+                "upstream_status": resp.status_code,
+                "upstream_body": resp.text[:2000],
+            },
+        )
+
+
+async def delete_agent(settings: Settings, *, agent_id: str) -> None:
+    """Call the voice vendor's real `DELETE /delete-agent/{agent_id}`.
+
+    Confirmed via a fresh live WebFetch of Retell's own current docs this
+    session (Tier 1 "delete an agent" work — see backend-dev.md's Feature
+    status section): `DELETE /delete-agent/{agent_id}`, success is `204 No
+    Content`, and the docs' own path-parameter description says plainly
+    "Deletes all versions of the agent" — there is no separate per-version
+    delete to worry about.
+
+    This is the one delete function this codebase was actually missing
+    before this task — `delete_phone_number()` (retell_adapter.py) and
+    `delete_retell_llm()` (above) already existed, both built purely for
+    manual live-verification cleanup with no router ever calling them, but
+    nothing here ever deleted the AGENT object itself. `DELETE
+    /agents/{agent_id}` (app/routers/agents.py) is this function's first
+    real caller.
+
+    **Retell's docs are silent on what happens to a phone number still bound
+    to the agent being deleted — confirmed via the same live WebFetch (no
+    mention either way).** This was resolved empirically instead of assumed:
+    see `DELETE /agents/{agent_id}`'s own docstring in app/routers/agents.py
+    for the real, live-observed vendor behavior and the resulting product
+    decision (unbind numbers first, ourselves, before ever calling this
+    function) — this function itself makes no assumption about that and
+    simply deletes the agent object it's told to.
+
+    Raises `AppError(code="upstream_failed")` on any network error or
+    non-2xx/non-404 response — same never-leak-raw-response contract, and
+    the same soft-fail-on-already-gone-is-success treatment of a 404, as
+    every other delete function in this codebase (`delete_phone_number`,
+    `delete_retell_llm`).
+    """
+    try:
+        async with httpx.AsyncClient(
+            base_url=settings.RETELL_API_BASE,
+            headers={
+                "Authorization": f"Bearer {settings.RETELL_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            timeout=httpx.Timeout(15.0),
+        ) as client:
+            resp = await client.delete(f"/delete-agent/{agent_id}")
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "Retell delete-agent request failed",
+            extra={"vendor": VENDOR_NAME, "error_class": type(exc).__name__},
+        )
+        raise AppError(
+            code=CODE_UPSTREAM_FAILED,
+            message="Could not reach the voice vendor to delete the agent. Try again shortly.",
+            status_code=502,
+            log_extra={"vendor": VENDOR_NAME, "error_class": type(exc).__name__},
+        ) from exc
+
+    if resp.status_code >= 400 and resp.status_code != 404:
+        logger.warning(
+            "Retell delete-agent returned an error",
+            extra={"vendor": VENDOR_NAME, "upstream_status": resp.status_code},
+        )
+        raise AppError(
+            code=CODE_UPSTREAM_FAILED,
+            message="The voice vendor rejected the request to delete the agent.",
             status_code=502,
             log_extra={
                 "vendor": VENDOR_NAME,

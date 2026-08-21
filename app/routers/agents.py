@@ -87,11 +87,12 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Path, status
+from fastapi import APIRouter, Depends, Path, Query, status
+from pydantic import BaseModel, ConfigDict
 
 from app.config import Settings, get_settings
 from app.deps import CurrentPlatform, DbDep
-from app.errors import CODE_VALIDATION, AppError
+from app.errors import CODE_NOT_FOUND, CODE_VALIDATION, AppError
 from app.models.agent import (
     AgentInDB,
     AgentPublic,
@@ -105,12 +106,60 @@ from app.models.phone_number import (
     ImportPhoneNumberRequest,
     PhoneNumberInDB,
     PhoneNumberPublic,
+    UpdatePhoneNumberRequest,
 )
 from app.repositories import agent_repo, phone_number_repo
 from app.services import retell_adapter, retell_agent_adapter
 from app.utils.ssrf_guard import reject_if_internal_url
 
 router = APIRouter(prefix="/agents", tags=["agents"])
+
+# Same pagination cap/default as GET /voices (app/routers/voices.py) — see
+# that module's docstring for why this is this codebase's established
+# list-endpoint convention. Kept as separate constants here (not imported
+# from voices.py) since the two routers have no other coupling and a shared
+# import purely for two integers would be a strange, backwards dependency.
+_MAX_LIMIT = 100
+_DEFAULT_LIMIT = 20
+
+
+class AgentListResponse(BaseModel):
+    """`GET /agents` response envelope — same `items`/`total_count`/`limit`/
+    `offset` shape as `GET /voices`' `VoiceListResponse` (see that module's
+    docstring for why this is the established pagination-envelope
+    convention for every list endpoint in this codebase, not just voices).
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "items": [],
+                "total_count": 0,
+                "limit": 20,
+                "offset": 0,
+            }
+        }
+    )
+
+    items: list[AgentPublic]
+    total_count: int
+    limit: int
+    offset: int
+
+
+class PhoneNumberListResponse(BaseModel):
+    """`GET /agents/{agent_id}/numbers` response envelope. A plain array
+    (`items` only, no `total_count`/`limit`/`offset`) since this list is
+    deliberately unpaginated — see
+    phone_number_repo.list_by_agent_id's own docstring for why a single
+    agent's own bound-number count is small enough that pagination ceremony
+    would serve no real caller need, mirroring the reasoning
+    GET /languages already used to justify skipping pagination for its own
+    small, bounded list."""
+
+    model_config = ConfigDict(json_schema_extra={"example": {"items": []}})
+
+    items: list[PhoneNumberPublic]
 
 
 def _to_public_number(number: PhoneNumberInDB) -> PhoneNumberPublic:
@@ -138,8 +187,7 @@ def _to_public(agent: AgentInDB) -> AgentPublic:
         # Derived, not stored — see AgentPublic's docstring for why this is
         # computed here rather than persisted as its own field.
         transfer_enabled=(
-            agent.response_engine == ResponseEngine.BUILTIN
-            and agent.transfer_number is not None
+            agent.response_engine == ResponseEngine.BUILTIN and agent.transfer_number is not None
         ),
         transfer_ring_duration_ms=agent.transfer_ring_duration_ms,
         transfer_on_hold_music=agent.transfer_on_hold_music,
@@ -641,9 +689,7 @@ async def update_agent(
     if body.states is not None:
         for state in body.states:
             for tool in state.tools:
-                await reject_if_internal_url(
-                    tool.webhook_url, field="states.tools.webhook_url"
-                )
+                await reject_if_internal_url(tool.webhook_url, field="states.tools.webhook_url")
 
     # ── Step 5: compute the merged, intended final state ──────────────
     new_prompt = body.prompt if body.prompt is not None else agent.prompt
@@ -656,9 +702,7 @@ async def update_agent(
         else agent.interruption_sensitivity
     )
     new_enable_backchannel = (
-        body.enable_backchannel
-        if body.enable_backchannel is not None
-        else agent.enable_backchannel
+        body.enable_backchannel if body.enable_backchannel is not None else agent.enable_backchannel
     )
     new_pronunciation_dictionary = (
         body.pronunciation_dictionary
@@ -687,9 +731,7 @@ async def update_agent(
     # means "leave the agent's existing Multi Prompt configuration
     # unchanged," never "the caller wants states cleared without saying so."
     new_states = body.states if body.states is not None else agent.states
-    new_starting_state = (
-        body.starting_state if body.states is not None else agent.starting_state
-    )
+    new_starting_state = body.starting_state if body.states is not None else agent.starting_state
     # welcome_message: explicit clear_welcome_message wins over "leave
     # alone", an explicit new value (including "") wins over both — same
     # precedence as transfer_number/clear_transfer_number above. `is not
@@ -845,9 +887,7 @@ async def update_agent(
         "voice_speed": new_voice_speed,
         "interruption_sensitivity": new_interruption_sensitivity,
         "enable_backchannel": new_enable_backchannel,
-        "pronunciation_dictionary": [
-            entry.model_dump() for entry in new_pronunciation_dictionary
-        ],
+        "pronunciation_dictionary": [entry.model_dump() for entry in new_pronunciation_dictionary],
     }
     # post_call_analysis_data is only meaningfully "updated" if the caller
     # actually touched structured_data_fields — otherwise leave the key out
@@ -1100,9 +1140,7 @@ async def update_agent(
     # follow llm_update_succeeded, not agent_update_succeeded, same
     # reasoning as every other LLM-object field in this block.
     persisted_states = new_states if llm_update_succeeded else agent.states
-    persisted_starting_state = (
-        new_starting_state if llm_update_succeeded else agent.starting_state
-    )
+    persisted_starting_state = new_starting_state if llm_update_succeeded else agent.starting_state
     # welcome_message lives on the same vendor object (the LLM) as
     # prompt/transfer_number/states above — same llm_update_succeeded
     # gating, same reasoning.
@@ -1122,17 +1160,13 @@ async def update_agent(
     persisted_languages = new_languages if agent_update_succeeded else agent.languages
     persisted_voice_speed = new_voice_speed if agent_update_succeeded else agent.voice_speed
     persisted_interruption_sensitivity = (
-        new_interruption_sensitivity
-        if agent_update_succeeded
-        else agent.interruption_sensitivity
+        new_interruption_sensitivity if agent_update_succeeded else agent.interruption_sensitivity
     )
     persisted_enable_backchannel = (
         new_enable_backchannel if agent_update_succeeded else agent.enable_backchannel
     )
     persisted_pronunciation_dictionary = (
-        new_pronunciation_dictionary
-        if agent_update_succeeded
-        else agent.pronunciation_dictionary
+        new_pronunciation_dictionary if agent_update_succeeded else agent.pronunciation_dictionary
     )
     persisted_structured_data_fields = (
         new_structured_data_fields if agent_update_succeeded else agent.structured_data_fields
@@ -1161,9 +1195,7 @@ async def update_agent(
     persisted_denoising_mode = (
         new_denoising_mode if agent_update_succeeded else agent.denoising_mode
     )
-    persisted_ambient_sound = (
-        new_ambient_sound if agent_update_succeeded else agent.ambient_sound
-    )
+    persisted_ambient_sound = new_ambient_sound if agent_update_succeeded else agent.ambient_sound
     persisted_ambient_sound_volume = (
         new_ambient_sound_volume if agent_update_succeeded else agent.ambient_sound_volume
     )
@@ -1183,9 +1215,7 @@ async def update_agent(
         new_reminder_max_count if agent_update_succeeded else agent.reminder_max_count
     )
     persisted_end_call_after_silence_ms = (
-        new_end_call_after_silence_ms
-        if agent_update_succeeded
-        else agent.end_call_after_silence_ms
+        new_end_call_after_silence_ms if agent_update_succeeded else agent.end_call_after_silence_ms
     )
     persisted_max_call_duration_ms = (
         new_max_call_duration_ms if agent_update_succeeded else agent.max_call_duration_ms
@@ -1204,9 +1234,7 @@ async def update_agent(
     )
     persisted_pii_config = new_pii_config if agent_update_succeeded else agent.pii_config
     persisted_post_call_analysis_model = (
-        new_post_call_analysis_model
-        if agent_update_succeeded
-        else agent.post_call_analysis_model
+        new_post_call_analysis_model if agent_update_succeeded else agent.post_call_analysis_model
     )
     persisted_handbook_config = (
         new_handbook_config if agent_update_succeeded else agent.handbook_config
@@ -1265,6 +1293,212 @@ async def update_agent(
         raise vendor_error
 
     return _to_public(updated_agent)
+
+
+@router.get(
+    "",
+    response_model=AgentListResponse,
+    status_code=status.HTTP_200_OK,
+    summary="List your own agents",
+    responses={
+        401: {"description": "Missing or invalid API key."},
+    },
+)
+async def list_agents(
+    caller: CurrentPlatform,
+    db: DbDep,
+    limit: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=_MAX_LIMIT,
+            description=f"Max agents to return, 1-{_MAX_LIMIT}. Default {_DEFAULT_LIMIT}.",
+        ),
+    ] = _DEFAULT_LIMIT,
+    offset: Annotated[
+        int,
+        Query(ge=0, description="Number of agents to skip, for paging. Default 0."),
+    ] = 0,
+) -> AgentListResponse:
+    """List every agent belonging to the calling platform, newest first.
+
+    Tenancy-scoped by construction — only ever returns the calling
+    platform's own agents, via the same `platform_id` filter every other
+    endpoint in this codebase uses (`agent_repo.list_by_platform_id`). No
+    filters in this first pass (a plain paginated list is enough to close
+    the real gap this endpoint exists for — see
+    vendor-docs/Phase1-Status-Report.html's Tier 1 table); add one later if
+    a real caller need for narrowing by e.g. `status` shows up.
+
+    Same `limit`/`offset` + `total_count` pagination convention as
+    `GET /voices` (this codebase's first list endpoint) — `limit` is capped
+    at 100 server-side regardless of what's requested.
+    """
+    agents, total_count = await agent_repo.list_by_platform_id(
+        db, platform_id=caller.id, limit=limit, offset=offset
+    )
+    return AgentListResponse(
+        items=[_to_public(agent) for agent in agents],
+        total_count=total_count,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get(
+    "/{agent_id}",
+    response_model=AgentPublic,
+    status_code=status.HTTP_200_OK,
+    summary="Look up one of your own agents",
+    responses={
+        404: {
+            "description": "No agent exists with this id for the calling platform.",
+        },
+    },
+)
+async def get_agent(
+    caller: CurrentPlatform,
+    db: DbDep,
+    agent_id: Annotated[str, Path(description="Our agent id, from POST /agents' response.")],
+) -> AgentPublic:
+    """Fetch the full current record for one agent — the exact same
+    `AgentPublic` shape `POST /agents` and `PATCH /agents/{agent_id}`
+    already return, reusing this router's own `_to_public()` mapping so all
+    three endpoints stay in sync by construction rather than by convention.
+
+    Tenancy-scoped exactly like every other single-record lookup in this
+    codebase (`agent_repo.get_by_id(..., platform_id=caller.id)`) — an
+    agent belonging to a different platform 404s, never 403.
+    """
+    agent = await agent_repo.get_by_id(db, agent_id, platform_id=caller.id)
+    if agent is None:
+        raise AppError(
+            code=CODE_NOT_FOUND,
+            message="No agent exists with that id.",
+            status_code=404,
+            field="agent_id",
+        )
+    return _to_public(agent)
+
+
+@router.delete(
+    "/{agent_id}",
+    response_model=None,
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete an agent and release any phone numbers bound to it",
+    description="""
+Permanently deletes this agent, both on the voice vendor's side and in our
+own records. Any phone numbers currently bound to this agent are released
+(deleted from the voice vendor and from our own records) first, as part of
+the same operation — see the response codes below for what happens if a
+number can't be released.
+
+**This cannot be undone.** There is no soft-delete/recovery path — create a
+new agent if you need one with the same configuration again.
+
+Call history (`GET /calls`, `GET /calls/{id}`) for this agent is left
+untouched — a past call is a historical fact, not a live reference to the
+agent, so deleting the agent does not delete or hide its call records.
+""",
+    responses={
+        404: {
+            "description": "No agent exists with this id for the calling platform.",
+        },
+        502: {
+            "description": "The voice vendor could not be reached or rejected the delete "
+            "request for the agent, its conversation-brain object, or one of its bound "
+            "phone numbers. Nothing on our own side is deleted until every real vendor-side "
+            "object involved is confirmed gone — see this endpoint's own docstring for the "
+            "full ordering/partial-failure contract.",
+        },
+    },
+)
+async def delete_agent(
+    caller: CurrentPlatform,
+    db: DbDep,
+    settings: Annotated[Settings, Depends(get_settings)],
+    agent_id: Annotated[str, Path(description="Our agent id, from POST /agents' response.")],
+) -> None:
+    """Delete an agent — the real vendor-side agent object (and, for a
+    `builtin`-mode agent, its separate conversation-brain/LLM object), any
+    phone numbers currently bound to it, and finally our own stored
+    records for all of the above.
+
+    **Real vendor behavior, confirmed live rather than assumed — this is
+    the actual design decision this endpoint had to make.** Retell's own
+    docs (a fresh WebFetch this session) are silent on what happens to a
+    phone number still bound to an agent being deleted — no mention either
+    way. Rather than guess, this was resolved empirically against the real
+    vendor account: deleting an agent that still has a number bound to it
+    **succeeds on the vendor's side regardless** — the agent is deleted, but
+    the phone number is silently left behind, still provisioned and still
+    billed on the vendor account, now bound to an agent that no longer
+    exists. This is the single worst outcome for Platform X: an orphaned,
+    still-billed resource with no agent left to answer calls to it, and (had
+    we mirrored that behavior) no record on our own side that it even
+    happened.
+
+    **So this endpoint deliberately does NOT mirror that vendor behavior.**
+    Instead, it unbinds every phone number bound to this agent FIRST,
+    genuinely releasing each one (a real `DELETE /delete-phone-number/
+    {phone_number}` call per number, then removing our own record), and
+    only deletes the agent object itself once every bound number is
+    confirmed gone. This is the same "small, natural extension of the code
+    already being touched" judgment call this task's own brief invited —
+    silently leaving a bound number to rot the way the vendor's own
+    dashboard-driven delete apparently allows would be a real, avoidable
+    defect for any Platform X integrator who deletes an agent without
+    separately remembering to release its numbers first.
+
+    **Ordering and partial-failure handling, decided explicitly — never
+    leave a caller in an ambiguous "some of this happened" state without
+    telling them exactly what.** Real vendor-side objects are deleted
+    BEFORE any of our own local records are removed, and in this order:
+    (1) every bound phone number, vendor-side then local record, one at a
+    time; (2) the agent's own LLM object, if it has one (`builtin` mode
+    only); (3) the agent object itself, vendor-side; (4) our own Agent
+    document, last. If any vendor-side delete call fails partway through,
+    this raises immediately with the real `upstream_failed`/502 contract —
+    whatever was already genuinely deleted (on the vendor's side and in our
+    own DB) up to that point stays deleted (a real delete is not something
+    to "roll back," and re-attempting it is a safe no-op per every delete
+    function's own soft-fail-on-404 behavior), and whatever hadn't been
+    reached yet is simply retried by calling this same endpoint again — a
+    plain, safe-to-retry sequence, not a transaction that needs a rollback
+    story. This mirrors this codebase's own established "never leave a
+    caller worse off than a clean retry would" spirit (see
+    create_retell_llm_agent()'s orphan-cleanup docstring and PATCH
+    /agents/{agent_id}'s own partial-failure contract for the same value
+    applied to creation/update).
+
+    Tenancy-scoped exactly like every other single-record operation in this
+    codebase (`agent_repo.get_by_id(..., platform_id=caller.id)`) — a
+    cross-platform delete attempt 404s, never 403, same discipline as
+    everywhere else. A `status == "failed"` agent (no real vendor_ref —
+    see POST /agents' persist-on-vendor-failure precedent) skips straight
+    to deleting our own local record, since there is no real vendor-side
+    agent object to delete in the first place.
+    """
+    agent = await agent_repo.get_by_id(db, agent_id, platform_id=caller.id)
+    if agent is None:
+        raise AppError(
+            code=CODE_NOT_FOUND,
+            message="No agent exists with that id.",
+            status_code=404,
+            field="agent_id",
+        )
+
+    bound_numbers = await phone_number_repo.list_by_agent_id(db, agent_id, platform_id=caller.id)
+    for number in bound_numbers:
+        await retell_adapter.delete_phone_number(settings, phone_number=number.phone_number)
+        await phone_number_repo.delete(db, number.id, platform_id=caller.id)
+
+    if agent.vendor_ref is not None:
+        if agent.response_engine == ResponseEngine.BUILTIN and agent.llm_ref is not None:
+            await retell_agent_adapter.delete_retell_llm(settings, llm_id=agent.llm_ref)
+        await retell_agent_adapter.delete_agent(settings, agent_id=agent.vendor_ref)
+
+    await agent_repo.delete(db, agent_id, platform_id=caller.id)
 
 
 @router.post(
@@ -1471,3 +1705,330 @@ async def import_phone_number(
         vendor=retell_adapter.VENDOR_NAME,
     )
     return _to_public_number(number)
+
+
+@router.get(
+    "/{agent_id}/numbers",
+    response_model=PhoneNumberListResponse,
+    status_code=status.HTTP_200_OK,
+    summary="List phone numbers bound to this agent",
+    responses={
+        404: {
+            "description": "No agent exists with this id for the calling platform.",
+        },
+    },
+)
+async def list_agent_numbers(
+    caller: CurrentPlatform,
+    db: DbDep,
+    agent_id: Annotated[str, Path(description="Our agent id, from POST /agents' response.")],
+) -> PhoneNumberListResponse:
+    """List every phone number currently bound to one agent — whether
+    purchased through `POST /agents/{agent_id}/numbers` or imported via its
+    `/byo` sibling, both are stored identically (see PhoneNumberInDB's own
+    docstring) so both show up here indistinguishably.
+
+    Tenancy-scoped like every other single-agent endpoint in this router — a
+    cross-platform `agent_id` 404s, never 403, and the numbers themselves
+    are looked up doubly-scoped (`agent_id` AND `platform_id`) via
+    `phone_number_repo.list_by_agent_id`. No pagination — see
+    PhoneNumberListResponse's own docstring for why.
+    """
+    agent = await agent_repo.get_by_id(db, agent_id, platform_id=caller.id)
+    if agent is None:
+        raise AppError(
+            code=CODE_NOT_FOUND,
+            message="No agent exists with that id.",
+            status_code=404,
+            field="agent_id",
+        )
+    numbers = await phone_number_repo.list_by_agent_id(db, agent_id, platform_id=caller.id)
+    return PhoneNumberListResponse(items=[_to_public_number(n) for n in numbers])
+
+
+@router.patch(
+    "/{agent_id}/numbers/{phone_number}",
+    response_model=PhoneNumberPublic,
+    status_code=status.HTTP_200_OK,
+    summary="Rename a phone number's nickname and/or rebind it to a different agent",
+    description="""
+Change a phone number's `nickname` and/or which agent it's bound to, without
+deleting and recreating it. Deleting a *bought* number risks losing it
+permanently (see DELETE /agents/{agent_id}/numbers/{phone_number}'s own
+docs), and for a BYO SIP number it means re-entering SIP trunk credentials
+all over again — this endpoint exists so a rename or a rebind, both low-risk
+operations, never require that level of risk.
+
+**This is a true partial update**: omit `nickname` to leave it unchanged,
+omit `agent_id` to leave the current binding unchanged, or set both in one
+call. There is no separate clear flag for `nickname` — send an empty string
+to clear it, since (unlike `welcome_message` on PATCH /agents/{agent_id}) an
+empty nickname has no other special meaning here.
+
+`agent_id`, if provided, must be one of your own agents (by our own agent
+id, from POST /agents' response — never the voice vendor's own id) that has
+actually finished creation on the voice vendor (`status != 'failed'`).
+""",
+    responses={
+        404: {
+            "description": "No agent exists with this id for the calling platform, or no "
+            "phone number matching that E.164 value is currently bound to it, or (if "
+            "`agent_id` was provided to rebind) no agent exists with THAT id for the "
+            "calling platform either.",
+        },
+        422: {
+            "description": "Request validation failed — either the request changes nothing "
+            "(both nickname and agent_id omitted), or the target agent_id names an agent "
+            "that never finished creation on the voice vendor (status 'failed').",
+        },
+        502: {
+            "description": "The voice vendor could not be reached or rejected the update "
+            "request. Our own record is not updated until the real vendor-side change is "
+            "confirmed, so a failed attempt here is always safe to simply retry.",
+        },
+    },
+)
+async def update_agent_number(
+    body: UpdatePhoneNumberRequest,
+    caller: CurrentPlatform,
+    db: DbDep,
+    settings: Annotated[Settings, Depends(get_settings)],
+    agent_id: Annotated[str, Path(description="Our agent id, from POST /agents' response.")],
+    phone_number: Annotated[
+        str,
+        Path(
+            description="The E.164 number to update, exactly as returned by "
+            "GET /agents/{agent_id}/numbers or the original purchase/import response."
+        ),
+    ],
+) -> PhoneNumberPublic:
+    """Rename and/or rebind one phone number currently bound to this agent.
+
+    Wires up `retell_adapter.update_phone_number()` (new this task, see that
+    function's own docstring for the full sourced field-name evidence trail
+    — a fresh live WebFetch of docs.retellai.com/api-references/
+    update-phone-number this session) to a real, tenancy-scoped endpoint.
+
+    Step by step:
+    1. Reject an entirely-empty request (nothing to do) with 422 — same
+       "an accidental no-op PATCH is far more likely a caller bug than a
+       deliberate confirm-nothing-changed request" reasoning as PATCH
+       /agents/{agent_id} (see that endpoint's own docstring, step 2); this
+       codebase has no GET for a single phone number to make the latter
+       use case sensible anyway.
+    2. Tenancy-scoped lookup of the AGENT this URL is nested under (404 if
+       missing/not-ours, never 403, same as every other agent-scoped
+       endpoint).
+    3. Tenancy-scoped lookup of the NUMBER itself, doubly-scoped to both
+       this `agent_id` AND `platform_id` (via
+       `phone_number_repo.list_by_agent_id`, the exact same lookup DELETE
+       /agents/{agent_id}/numbers/{phone_number} already uses) — a
+       well-formed E.164 number that exists but belongs to a different
+       agent (even one owned by the same platform) or a different platform
+       entirely also 404s, never 403, same discipline as everywhere else.
+    4. If `agent_id` was provided to rebind: a SEPARATE tenancy-scoped
+       lookup of the TARGET agent (`agent_repo.get_by_id(db, body.agent_id,
+       platform_id=caller.id)`) — this is the core tenancy boundary this
+       endpoint has to enforce that no other numbers endpoint does: a
+       caller must never be able to rebind their own number to point at
+       ANOTHER platform's agent. A target agent that doesn't belong to the
+       calling platform (or doesn't exist at all) 404s on `body.agent_id`,
+       never 403 — same "never let a lookup confirm a resource exists that
+       isn't yours" discipline as every other cross-platform check in this
+       codebase. Combined with step 3's own scoping, this means BOTH the
+       number being updated AND the agent being rebound to are
+       independently confirmed to belong to the calling platform before any
+       vendor call is attempted — a caller can never use this endpoint to
+       touch a resource (number or agent) that isn't theirs, in either
+       direction.
+    5. If the target agent's own vendor creation never finished
+       (`status == 'failed'` / `vendor_ref is None`) — same guard already
+       used by both CREATE number endpoints — reject with 422 before ever
+       calling the vendor, since there is no real vendor-side agent id to
+       bind to.
+    6. Call the vendor. A failure here raises the real
+       `upstream_failed`/502 contract and leaves our own record completely
+       untouched (no partial/inconsistent state) — safe to simply retry,
+       same "never update our own record ahead of a confirmed vendor-side
+       success" ordering as DELETE /agents/{agent_id}/numbers/{phone_number}.
+    7. Only once the vendor call succeeds: update our own PhoneNumbers
+       record's `nickname`/`agent_id` fields to match, and return the
+       fresh, tenancy-scoped `PhoneNumberPublic`.
+    """
+    agent = await agent_repo.get_by_id(db, agent_id, platform_id=caller.id)
+    if agent is None:
+        raise AppError(
+            code=CODE_NOT_FOUND,
+            message="No agent exists with that id.",
+            status_code=404,
+            field="agent_id",
+        )
+
+    numbers = await phone_number_repo.list_by_agent_id(db, agent_id, platform_id=caller.id)
+    match = next((n for n in numbers if n.phone_number == phone_number), None)
+    if match is None:
+        raise AppError(
+            code=CODE_NOT_FOUND,
+            message="No phone number matching that value is currently bound to this agent.",
+            status_code=404,
+            field="phone_number",
+        )
+
+    if not body.has_any_field_set():
+        raise AppError(
+            code=CODE_VALIDATION,
+            message="This request doesn't change anything — set at least one of "
+            "nickname/agent_id.",
+            status_code=422,
+        )
+
+    # Resolve the intended post-update binding: rebind to a NEW target agent
+    # (step 4 of this endpoint's own docstring — a separate, independent
+    # tenancy check from the path-param agent above) if body.agent_id was
+    # given, otherwise leave the number bound to the agent it's already
+    # bound to.
+    if body.agent_id is not None:
+        target_agent = await agent_repo.get_by_id(db, body.agent_id, platform_id=caller.id)
+        if target_agent is None:
+            raise AppError(
+                code=CODE_NOT_FOUND,
+                message="No agent exists with that id.",
+                status_code=404,
+                field="agent_id",
+            )
+        if target_agent.status == AgentStatus.FAILED or target_agent.vendor_ref is None:
+            raise AppError(
+                code=CODE_VALIDATION,
+                message="This agent never finished creation on the voice vendor, so a phone "
+                "number can't be rebound to it yet. Retry creating the agent first.",
+                status_code=422,
+                field="agent_id",
+            )
+        new_agent_id = target_agent.id
+        new_retell_agent_id = target_agent.vendor_ref
+    else:
+        new_agent_id = agent.id
+        new_retell_agent_id = None
+
+    new_nickname = body.nickname if body.nickname is not None else match.nickname
+
+    await retell_adapter.update_phone_number(
+        settings,
+        phone_number=match.phone_number,
+        nickname=body.nickname,
+        retell_agent_id=new_retell_agent_id,
+    )
+
+    await phone_number_repo.update(
+        db,
+        match.id,
+        platform_id=caller.id,
+        nickname=new_nickname,
+        agent_id=new_agent_id,
+    )
+
+    updated = await phone_number_repo.list_by_agent_id(db, new_agent_id, platform_id=caller.id)
+    updated_number = next(n for n in updated if n.phone_number == match.phone_number)
+    return _to_public_number(updated_number)
+
+
+@router.delete(
+    "/{agent_id}/numbers/{phone_number}",
+    response_model=None,
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Release a phone number bound to this agent",
+    description="""
+Permanently releases this phone number — deleted from the voice vendor
+(so it stops being provisioned/billed on the vendor account) and from our
+own records. The agent itself is untouched; only the number is removed.
+
+**This cannot be undone.** A released number is not guaranteed to be
+available to re-provision later (the vendor may reassign it to someone
+else's account, same as releasing any real phone number).
+""",
+    responses={
+        404: {
+            "description": "No agent exists with this id for the calling platform, or no "
+            "phone number matching that E.164 value is currently bound to it.",
+        },
+        502: {
+            "description": "The voice vendor could not be reached or rejected the release "
+            "request. Our own record is not removed until the real vendor-side release is "
+            "confirmed, so a failed attempt here is always safe to simply retry.",
+        },
+    },
+)
+async def delete_agent_number(
+    caller: CurrentPlatform,
+    db: DbDep,
+    settings: Annotated[Settings, Depends(get_settings)],
+    agent_id: Annotated[str, Path(description="Our agent id, from POST /agents' response.")],
+    phone_number: Annotated[
+        str,
+        Path(
+            description="The E.164 number to release, exactly as returned by "
+            "GET /agents/{agent_id}/numbers or the original purchase/import response."
+        ),
+    ],
+) -> None:
+    """Release one phone number bound to this agent.
+
+    Wires up `retell_adapter.delete_phone_number()` — the vendor-calling
+    function that already existed in this codebase purely for manual
+    live-verification cleanup (see that function's own docstring) — to a
+    real, tenancy-scoped endpoint for the first time. Confirmed via that
+    function's own sourced evidence (a live WebFetch this session,
+    `DELETE /delete-phone-number/{phone_number}`) that a 404 (already
+    gone on the vendor's side) is treated as success, not an error — the
+    end state ("number no longer ours") is the same either way, so a
+    caller who retries a delete that actually already succeeded gets a
+    clean 204, not a confusing error.
+
+    **Real vendor behavior for releasing a number that's actively bound to
+    an agent, confirmed via the same live WebFetch this session that covers
+    `DELETE /delete-agent/{agent_id}` (see that endpoint's own docstring for
+    the fuller agent-deletion investigation): the vendor's docs make no
+    special mention of a bound number blocking or complicating a plain
+    phone-number delete, and deleting the NUMBER (as opposed to the AGENT)
+    is the more surgical, lower-risk operation of the two — it only ever
+    affects the one resource explicitly named in the request.** No
+    additional unbinding step is needed here (contrast with `DELETE
+    /agents/{agent_id}`, which unbinds every number FIRST specifically
+    because deleting the AGENT was confirmed to silently orphan any number
+    left bound to it).
+
+    Tenancy-scoped in two steps: the agent itself (cross-platform `agent_id`
+    404s, never 403, same as every other agent-scoped endpoint), then the
+    specific number, looked up scoped to BOTH `agent_id` and `platform_id`
+    (via `phone_number_repo.list_by_agent_id`) — a well-formed E.164 number
+    that exists but belongs to a different agent (even one owned by the
+    same platform) or a different platform entirely also 404s, never 403,
+    same "never let a lookup confirm a resource exists that isn't yours"
+    discipline as everywhere else in this codebase.
+
+    Our own `PhoneNumbers` record is only removed AFTER the real vendor-side
+    release is confirmed — a failed vendor call raises the real
+    `upstream_failed`/502 and leaves our own record untouched, so retrying
+    this same call is always safe.
+    """
+    agent = await agent_repo.get_by_id(db, agent_id, platform_id=caller.id)
+    if agent is None:
+        raise AppError(
+            code=CODE_NOT_FOUND,
+            message="No agent exists with that id.",
+            status_code=404,
+            field="agent_id",
+        )
+
+    numbers = await phone_number_repo.list_by_agent_id(db, agent_id, platform_id=caller.id)
+    match = next((n for n in numbers if n.phone_number == phone_number), None)
+    if match is None:
+        raise AppError(
+            code=CODE_NOT_FOUND,
+            message="No phone number matching that value is currently bound to this agent.",
+            status_code=404,
+            field="phone_number",
+        )
+
+    await retell_adapter.delete_phone_number(settings, phone_number=match.phone_number)
+    await phone_number_repo.delete(db, match.id, platform_id=caller.id)

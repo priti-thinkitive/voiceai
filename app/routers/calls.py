@@ -152,8 +152,9 @@ from __future__ import annotations
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Path, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Depends, Path, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import Response
+from pydantic import BaseModel, ConfigDict
 from starlette import status as ws_status
 
 from app.config import Settings, get_settings
@@ -170,6 +171,37 @@ from app.services.storage import get_storage_service, recording_key, transcript_
 logger = logging.getLogger("app.calls.live_transcript")
 
 router = APIRouter(prefix="/calls", tags=["calls"])
+
+# Same pagination cap/default GET /voices and GET /agents already established
+# as this codebase's list-endpoint convention (see app/routers/voices.py's
+# module docstring) — kept as separate constants here, same "no cross-router
+# coupling purely to share two integers" reasoning as app/routers/agents.py's
+# own copy.
+_MAX_LIMIT = 100
+_DEFAULT_LIMIT = 20
+
+
+class CallListResponse(BaseModel):
+    """`GET /calls` response envelope — same `items`/`total_count`/`limit`/
+    `offset` shape as every other list endpoint in this codebase (see
+    app/routers/voices.py's module docstring for the established
+    convention)."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "items": [],
+                "total_count": 0,
+                "limit": 20,
+                "offset": 0,
+            }
+        }
+    )
+
+    items: list[CallPublic]
+    total_count: int
+    limit: int
+    offset: int
 
 
 def _to_public(call: CallInDB) -> CallPublic:
@@ -325,6 +357,62 @@ async def create_outbound_call(
         raise vendor_error
 
     return _to_public(call)
+
+
+@router.get(
+    "",
+    response_model=CallListResponse,
+    status_code=status.HTTP_200_OK,
+    summary="List your own calls",
+    responses={
+        401: {"description": "Missing or invalid API key."},
+    },
+)
+async def list_calls(
+    caller: CurrentPlatform,
+    db: DbDep,
+    limit: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=_MAX_LIMIT,
+            description=f"Max calls to return, 1-{_MAX_LIMIT}. Default {_DEFAULT_LIMIT}.",
+        ),
+    ] = _DEFAULT_LIMIT,
+    offset: Annotated[
+        int,
+        Query(ge=0, description="Number of calls to skip, for paging. Default 0."),
+    ] = 0,
+) -> CallListResponse:
+    """List every call belonging to the calling platform, newest first —
+    closes the real, documented gap that browsing call history required
+    already knowing every individual call id in advance (see
+    vendor-docs/Phase1-Status-Report.html's Tier 1 table).
+
+    Reads from our own `Calls` collection (`call_repo.list_by_platform_id`),
+    never a live vendor call — same as `GET /calls/{call_id}` above. Same
+    `limit`/`offset` + `total_count` pagination convention as every other
+    list endpoint in this codebase.
+
+    No filters in this first pass (deliberately the simpler version — see
+    call_repo.list_by_platform_id's own docstring for the full reasoning);
+    add `agent_id`/`status`/`direction` filters later if a real caller need
+    for narrowing shows up.
+
+    **Known limitation, same as GET /calls/{call_id}**: a genuinely inbound
+    call (one that rang in with no prior POST /calls/outbound trigger) has
+    no Calls record at all today, so it will not appear in this list either
+    — see this module's docstring for the full, separate, not-yet-built gap.
+    """
+    calls, total_count = await call_repo.list_by_platform_id(
+        db, platform_id=caller.id, limit=limit, offset=offset
+    )
+    return CallListResponse(
+        items=[_to_public(call) for call in calls],
+        total_count=total_count,
+        limit=limit,
+        offset=offset,
+    )
 
 
 async def _get_owned_call(db: MongoDB, caller_id: str, call_id: str) -> CallInDB:

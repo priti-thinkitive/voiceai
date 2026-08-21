@@ -1521,11 +1521,11 @@ class AgentInDB(BaseModel):
 
     `vendor`, `vendor_ref`, and `llm_ref` are internal-only — correlate a
     document back to whichever vendor/adapter created it and to that
-    vendor's own record IDs (Retell's `agent_id` and, for `retell_llm`-mode
-    agents only, Retell's separate `llm_id`), for webhook correlation and
-    support debugging. Never exposed on AgentPublic — see the Database rules
-    in the standards doc: the vendor's own ID is stored, but only as a
-    clearly-internal field.
+    vendor's own record IDs (the voice vendor's `agent_id` and, for
+    `retell_llm`-mode agents only, the voice vendor's separate `llm_id`),
+    for webhook correlation and support debugging. Never exposed on
+    AgentPublic — see the Database rules in the standards doc: the vendor's
+    own ID is stored, but only as a clearly-internal field.
 
     `llm_ref` gets its own field rather than being folded into `vendor_ref`
     because it names a genuinely separate vendor-side resource — under

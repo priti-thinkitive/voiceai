@@ -12,6 +12,7 @@ backend-dev.md's Feature status section for that evidence trail.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -835,7 +836,11 @@ async def test_retell_adapter_builds_correct_voicemail_option_wire_shape(
         status_code = 201
 
         def json(self) -> dict[str, Any]:
-            return {"call_id": "call_wire_shape", "agent_id": "agent_x", "call_status": "registered"}
+            return {
+                "call_id": "call_wire_shape",
+                "agent_id": "agent_x",
+                "call_status": "registered",
+            }
 
     async def _fake_post(self: Any, url: str, json: dict[str, Any]) -> _FakeResponse:  # noqa: A002
         captured["url"] = url
@@ -893,3 +898,136 @@ async def test_retell_adapter_omits_voicemail_option_when_not_set(
     )
 
     assert "voicemail_option" not in captured["json"]
+
+
+# ── GET /calls (Tier 1) ───────────────────────────────────────────────────
+
+
+async def test_list_calls_missing_auth_is_401(client: AsyncClient) -> None:
+    resp = await client.get("/calls")
+    assert resp.status_code == 401
+    assert resp.json()["detail"]["code"] == "unauthenticated"
+
+
+async def test_list_calls_empty_for_new_platform(client: AsyncClient, db: MongoDB) -> None:
+    api_key, _ = await _seed_platform(db, "Platform A")
+    resp = await client.get("/calls", headers={"Authorization": f"Bearer {api_key}"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {"items": [], "total_count": 0, "limit": 20, "offset": 0}
+
+
+async def test_list_calls_success_newest_first(
+    client: AsyncClient, db: MongoDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(retell_adapter, "create_phone_call", _fake_create_phone_call())
+
+    api_key, platform_id = await _seed_platform(db, "Platform A")
+    agent_id = await _seed_active_agent(db, platform_id=platform_id, vendor_ref="agent_retell_1")
+    await _seed_owned_number(db, platform_id=platform_id, agent_id=agent_id)
+
+    call_ids: list[str] = []
+    for _ in range(3):
+        resp = await client.post(
+            "/calls/outbound",
+            json={
+                "from_number": "+19129143920",
+                "to_number": _VALID_TO_NUMBER,
+                "agent_id": agent_id,
+            },
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        assert resp.status_code == 201
+        call_ids.append(resp.json()["id"])
+        # A tiny real delay between inserts — `created_at` is only
+        # millisecond-resolution `datetime.now(UTC)`, and rapid-fire inserts
+        # can otherwise tie, making "newest first" genuinely ambiguous
+        # rather than actually wrong.
+        await asyncio.sleep(0.01)
+
+    resp = await client.get("/calls", headers={"Authorization": f"Bearer {api_key}"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total_count"] == 3
+    assert body["limit"] == 20
+    assert body["offset"] == 0
+    assert len(body["items"]) == 3
+    # Newest first.
+    assert [item["id"] for item in body["items"]] == list(reversed(call_ids))
+    # Never leak vendor identity.
+    for item in body["items"]:
+        assert "vendor" not in item
+        assert "vendor_ref" not in item
+
+
+async def test_list_calls_pagination_limit_and_offset(
+    client: AsyncClient, db: MongoDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(retell_adapter, "create_phone_call", _fake_create_phone_call())
+
+    api_key, platform_id = await _seed_platform(db, "Platform A")
+    agent_id = await _seed_active_agent(db, platform_id=platform_id, vendor_ref="agent_retell_1")
+    await _seed_owned_number(db, platform_id=platform_id, agent_id=agent_id)
+
+    for _ in range(5):
+        resp = await client.post(
+            "/calls/outbound",
+            json={
+                "from_number": "+19129143920",
+                "to_number": _VALID_TO_NUMBER,
+                "agent_id": agent_id,
+            },
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        assert resp.status_code == 201
+
+    resp = await client.get(
+        "/calls", params={"limit": 2, "offset": 1}, headers={"Authorization": f"Bearer {api_key}"}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total_count"] == 5
+    assert body["limit"] == 2
+    assert body["offset"] == 1
+    assert len(body["items"]) == 2
+
+
+async def test_list_calls_limit_over_cap_is_422(client: AsyncClient, db: MongoDB) -> None:
+    api_key, _ = await _seed_platform(db, "Platform A")
+    resp = await client.get(
+        "/calls", params={"limit": 101}, headers={"Authorization": f"Bearer {api_key}"}
+    )
+    assert resp.status_code == 422
+
+
+async def test_list_calls_tenancy_isolation(
+    client: AsyncClient, db: MongoDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mandatory per the standards doc: Platform A never sees Platform B's
+    calls in a list response.
+    """
+    monkeypatch.setattr(retell_adapter, "create_phone_call", _fake_create_phone_call())
+
+    key_a, id_a = await _seed_platform(db, "Platform A")
+    key_b, id_b = await _seed_platform(db, "Platform B")
+    agent_a_id = await _seed_active_agent(db, platform_id=id_a, vendor_ref="agent_retell_a")
+    await _seed_owned_number(db, platform_id=id_a, agent_id=agent_a_id)
+
+    resp_a = await client.post(
+        "/calls/outbound",
+        json={
+            "from_number": "+19129143920",
+            "to_number": _VALID_TO_NUMBER,
+            "agent_id": agent_a_id,
+        },
+        headers={"Authorization": f"Bearer {key_a}"},
+    )
+    assert resp_a.status_code == 201
+
+    resp_b = await client.get("/calls", headers={"Authorization": f"Bearer {key_b}"})
+    assert resp_b.status_code == 200
+    assert resp_b.json() == {"items": [], "total_count": 0, "limit": 20, "offset": 0}
+
+    resp_a_list = await client.get("/calls", headers={"Authorization": f"Bearer {key_a}"})
+    assert resp_a_list.status_code == 200
+    assert resp_a_list.json()["total_count"] == 1

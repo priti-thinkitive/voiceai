@@ -171,9 +171,7 @@ def _from_doc(doc: dict[str, Any]) -> AgentInDB:
             "end_call_after_silence_ms", _FALLBACK_END_CALL_AFTER_SILENCE_MS
         ),
         max_call_duration_ms=doc.get("max_call_duration_ms", _FALLBACK_MAX_CALL_DURATION_MS),
-        begin_message_delay_ms=doc.get(
-            "begin_message_delay_ms", _FALLBACK_BEGIN_MESSAGE_DELAY_MS
-        ),
+        begin_message_delay_ms=doc.get("begin_message_delay_ms", _FALLBACK_BEGIN_MESSAGE_DELAY_MS),
         allow_user_dtmf=doc.get("allow_user_dtmf", _FALLBACK_ALLOW_USER_DTMF),
         allow_dtmf_interruption=doc.get(
             "allow_dtmf_interruption", _FALLBACK_ALLOW_DTMF_INTERRUPTION
@@ -467,15 +465,79 @@ async def update(
                 ),
                 "post_call_analysis_model": post_call_analysis_model,
                 "handbook_config": (
-                    handbook_config.model_dump(mode="json")
-                    if handbook_config is not None
-                    else None
+                    handbook_config.model_dump(mode="json") if handbook_config is not None else None
                 ),
                 "updated_at": now,
             }
         },
     )
     return result.modified_count == 1
+
+
+async def list_by_platform_id(
+    db: MongoDB, *, platform_id: str, limit: int, offset: int
+) -> tuple[list[AgentInDB], int]:
+    """Tenancy-scoped paginated list — `GET /agents`'s only real query.
+    Follows the exact `limit`/`offset` + `total_count` convention
+    `GET /voices` already established as this codebase's pagination pattern
+    (see app/routers/voices.py's module docstring) — newest-first
+    (`created_at` descending), no filters, matching this codebase's
+    documented "lean toward the simpler version" bias for a first pass at
+    an owned-resource list (contrast with `GET /voices`, which needs
+    filters because it's a large third-party catalog a caller has to search;
+    an individual platform's own agent count is nowhere near that scale).
+
+    Unlike GET /voices (which fetches an entire third-party catalog into
+    memory and paginates in Python because the vendor's own endpoint has no
+    server-side paging), this is OUR OWN Mongo collection — so pagination
+    and the total count both happen as real, indexed Mongo operations
+    (`.skip()`/`.limit()`, `count_documents`), never an unbounded
+    `.to_list(length=None)`, per the standards doc's "No unbounded queries"
+    rule. `platform_id` is already indexed (see app/database.py), so this
+    stays a single indexed query pattern, not a full collection scan.
+    """
+    cursor = (
+        db[AGENTS]
+        .find({"platform_id": platform_id})
+        .sort("created_at", -1)
+        .skip(offset)
+        .limit(limit)
+    )
+    docs = await cursor.to_list(length=limit)
+    total_count = await db[AGENTS].count_documents({"platform_id": platform_id})
+    return [_from_doc(doc) for doc in docs], total_count
+
+
+async def delete(db: MongoDB, agent_id: str, *, platform_id: str) -> bool:
+    """Tenancy-scoped hard delete of our own Agents document — always called
+    AFTER the router has already dealt with the real vendor-side agent
+    object (and any bound phone numbers) via
+    retell_agent_adapter.delete_agent()/delete_retell_llm() and
+    phone_number_repo — see DELETE /agents/{agent_id}'s own docstring in
+    app/routers/agents.py for the full ordering/partial-failure contract
+    this function is one step of.
+
+    A genuine hard delete, not a soft-delete/status flag — unlike
+    `Platform.status` (revoked-but-kept, since a platform's own API key
+    history/audit trail matters), an Agent has no equivalent ongoing need to
+    keep a "deleted" record around: nothing in this codebase reads a
+    deleted agent's own fields again (Calls history references it only by
+    our own Mongo `agent_id` string, which remains a valid, dereferenceable
+    historical fact even after the parent document is gone — see this
+    function's own caller for the "Calls records are left alone, not
+    cascaded" decision and reasoning).
+
+    Returns a bool (`deleted_count == 1`), same "thin, explicit write path,
+    caller decides what it means" convention as `update()` above. `False`
+    covers both "agent_id malformed" and "no matching document for this
+    platform_id" — the router already did its own tenancy-scoped
+    `get_by_id()` lookup before calling this, so a `False` here would only
+    happen from a genuinely concurrent delete of the same record.
+    """
+    if not ObjectId.is_valid(agent_id):
+        return False
+    result = await db[AGENTS].delete_one({"_id": ObjectId(agent_id), "platform_id": platform_id})
+    return result.deleted_count == 1
 
 
 async def get_by_vendor_ref(db: MongoDB, vendor_ref: str) -> AgentInDB | None:

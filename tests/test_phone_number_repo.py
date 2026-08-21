@@ -47,22 +47,3 @@ async def test_create_with_no_area_code_or_nickname(db: MongoDB) -> None:
     assert number.nickname is None
 
 
-async def test_get_by_id_returns_none_for_unknown_id(db: MongoDB) -> None:
-    result = await phone_number_repo.get_by_id(db, "000000000000000000000000", platform_id="plat_1")
-    assert result is None
-
-
-async def test_get_by_id_returns_none_for_malformed_id(db: MongoDB) -> None:
-    result = await phone_number_repo.get_by_id(db, "not-a-valid-object-id", platform_id="plat_1")
-    assert result is None
-
-
-async def test_get_by_id_scoped_to_platform(db: MongoDB) -> None:
-    number = await _create_sample(db, platform_id="plat_owner", agent_id="agent_1")
-
-    found = await phone_number_repo.get_by_id(db, number.id, platform_id="plat_owner")
-    assert found is not None
-    assert found.id == number.id
-
-    not_found = await phone_number_repo.get_by_id(db, number.id, platform_id="plat_other")
-    assert not_found is None

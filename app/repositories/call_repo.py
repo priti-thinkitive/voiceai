@@ -97,6 +97,43 @@ async def get_by_id(db: MongoDB, call_id: str, *, platform_id: str) -> CallInDB 
     return _from_doc(doc) if doc else None
 
 
+async def list_by_platform_id(
+    db: MongoDB, *, platform_id: str, limit: int, offset: int
+) -> tuple[list[CallInDB], int]:
+    """Tenancy-scoped paginated list — `GET /calls`'s only real query.
+    Same `limit`/`offset` + `total_count`, newest-first, no-filters-for-now
+    convention as `agent_repo.list_by_platform_id` (see that function's own
+    docstring for the full pagination-pattern reasoning shared by both).
+
+    Deliberately no filters (`agent_id`/`status`/`direction`) in this first
+    pass, even though `CallPublic` has fields that would support them —
+    per the task's own explicit "lean toward the simpler version unless a
+    filter is trivial to add" guidance. A plain paginated newest-first list
+    is enough to close the real, documented gap ("Browsing call history
+    today means knowing every individual call id in advance" — see
+    vendor-docs/Phase1-Status-Report.html's Tier 1 table); add filters when
+    a concrete caller need for narrowing shows up, same "don't build for
+    hypothetical futures" bias this codebase applies elsewhere.
+
+    A platform's own call history is exactly the kind of collection the
+    standards doc's "No unbounded queries" rule anticipates growing large
+    over time (unlike a single agent's bound phone numbers) — so, same as
+    agent_repo.list_by_platform_id, this is a real indexed `.skip()`/
+    `.limit()` Mongo query plus `count_documents`, never `.to_list(length=
+    None)`. `platform_id` is already indexed (see app/database.py).
+    """
+    cursor = (
+        db[CALLS]
+        .find({"platform_id": platform_id})
+        .sort("created_at", -1)
+        .skip(offset)
+        .limit(limit)
+    )
+    docs = await cursor.to_list(length=limit)
+    total_count = await db[CALLS].count_documents({"platform_id": platform_id})
+    return [_from_doc(doc) for doc in docs], total_count
+
+
 async def get_by_vendor_ref(db: MongoDB, vendor_ref: str) -> CallInDB | None:
     """Lookup by the voice vendor's own call id, with NO platform_id
     filter — deliberately different from get_by_id above, and only ever used
